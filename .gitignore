@@ -1,0 +1,21 @@
+# .NET build outputs
+bin/
+obj/
+*.user
+*.suo
+
+# .NET tooling
+.vs/
+*.swp
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets (env vars are the supported channel; never commit creds)
+*.local.env
+appsettings.local.json
