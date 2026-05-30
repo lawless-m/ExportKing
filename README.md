@@ -1,5 +1,8 @@
 # ExportKing
 
+> **Picking this up?** Read [`NEXT_STEPS.md`](NEXT_STEPS.md) first — it's the
+> actionable to-do list. `PLAN.md` is the staged history.
+
 Native-protocol DBISAM client for .NET 9. Talks directly to `dbsrvr.exe` over
 TCP, bypassing the broken DBISAM ODBC driver. The initial consumer is
 `RocsMiddleware`, replacing every Windows-only `OdbcConnection`-against-
