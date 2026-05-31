@@ -92,6 +92,16 @@ public sealed class CursorBatch
     /// on-disk record (header + column data). Empty if result code wasn't OK.
     /// </summary>
     public required List<(int Offset, int Length)> Rows { get; init; }
+
+    /// <summary>
+    /// Per-row physical-record bookmarks, one per entry in <see cref="Rows"/>
+    /// (offset/length into the same response body). Used by blob fetch to
+    /// recover each row's <c>PhysicalRecordNumber</c> via
+    /// <see cref="Blob.PhysicalRecordNumberFromBookmark"/>. Empty when the
+    /// server didn't send a bookmark buffer (single-row replies) — callers
+    /// that don't need bookmarks ignore it.
+    /// </summary>
+    public List<(int Offset, int Length)> Bookmarks { get; init; } = new();
 }
 
 /// <summary>
@@ -161,6 +171,7 @@ public static class Response
         var cursorInfo = CursorInfo.Read(walker);
 
         var rows = new List<(int Offset, int Length)>();
+        var bookmarks = new List<(int Offset, int Length)>();
         var countUnit = walker.NextUnit();
         if (countUnit is not null && countUnit.Value.Length == 4)
         {
@@ -183,8 +194,22 @@ public static class Response
                         rows.Add((payloadStart + i * actualRecordSize, actualRecordSize));
                     }
                 }
-                // Bookmark buffer: per-row bookmarks. Consume but ignore.
-                _ = walker.NextUnit();
+
+                // Bookmark buffer: per-row physical-record bookmarks,
+                // concatenated. Slice them the same way as rows so blob
+                // fetch can recover each row's PhysicalRecordNumber. The
+                // per-row width is bookmark_buf.Length / rowCount.
+                int bmBufStart = walker.Position;
+                var bmBuf = walker.NextUnit();
+                if (bmBuf is not null && rowCount > 0 && bmBuf.Value.Length % rowCount == 0)
+                {
+                    int perRow = bmBuf.Value.Length / rowCount;
+                    int bmPayloadStart = bmBufStart + 4;
+                    for (int i = 0; i < rowCount; i++)
+                    {
+                        bookmarks.Add((bmPayloadStart + i * perRow, perRow));
+                    }
+                }
             }
         }
 
@@ -193,6 +218,7 @@ public static class Response
             ResultCode = resultCode,
             CursorInfo = cursorInfo,
             Rows = rows,
+            Bookmarks = bookmarks,
         };
     }
 

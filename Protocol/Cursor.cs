@@ -115,14 +115,20 @@ public static class Cursor
                 }
                 if (batch is null) return false;
 
-                foreach (var (offset, length) in batch.Rows)
+                for (int i = 0; i < batch.Rows.Count; i++)
                 {
                     if (rowsSeen >= targetRows) return true;
+                    var (offset, length) = batch.Rows[i];
                     // Pass the full record (header + column data). Row.DecodeRecord
                     // slices off the header internally; downstream blob-fetch needs
                     // the 16-byte MD5 from the header (bytes 9..25).
                     var fullRow = new ReadOnlySpan<byte>(body, offset, length);
-                    onRow(fullRow);
+                    // Per-row physical-record bookmark (empty for single-row
+                    // replies); blob fetch reads PhysicalRecordNumber from it.
+                    ReadOnlySpan<byte> bookmark = i < batch.Bookmarks.Count
+                        ? new ReadOnlySpan<byte>(body, batch.Bookmarks[i].Offset, batch.Bookmarks[i].Length)
+                        : default;
+                    onRow(fullRow, bookmark);
                     rowsSeen++;
                 }
                 if (batch.ResultCode != Response.ResultOk) return true;
@@ -147,9 +153,14 @@ public static class Cursor
 }
 
 /// <summary>
-/// Callback invoked once per row. The span covers the full on-disk record
-/// (header + column data); use <see cref="Row.DecodeRecord"/> to decode and
-/// <see cref="Row.ExtractRecordHash"/> for the row's MD5 (needed for blob fetch).
-/// The span is valid only for the call duration.
+/// Callback invoked once per row. <paramref name="fullRecord"/> covers the
+/// full on-disk record (header + column data); use
+/// <see cref="Row.DecodeRecord"/> to decode and
+/// <see cref="Row.ExtractRecordHash"/> for the row's MD5 (needed for blob
+/// fetch). <paramref name="bookmark"/> is the row's physical-record bookmark
+/// (empty for single-row replies) — pass it to
+/// <see cref="Blob.PhysicalRecordNumberFromBookmark"/> to recover the
+/// PhysicalRecordNumber a blob fetch needs. Both spans are valid only for
+/// the call duration.
 /// </summary>
-public delegate void RowHandler(ReadOnlySpan<byte> fullRecord);
+public delegate void RowHandler(ReadOnlySpan<byte> fullRecord, ReadOnlySpan<byte> bookmark);

@@ -38,36 +38,32 @@ To capture while iterating:
 
 ---
 
-## 2. Finish blob/memo fetch (the unfinished thing)
+## 2. Blob/memo fetch — ✅ DONE (was the unfinished thing)
 
-**State:** `Messages.BuildOpenBlob` produces bytes that are byte-for-byte
-identical to a real DBSYS `0x0280` request — see
-`ExportKing.Tests/Protocol/OpenBlobMatchesCaptureTest.cs`. But the live
-server returns error `0x3A9A`. The same error fires on `GetNextRecord`,
-so the issue is **cursor state preamble**, not the OpenBlob bytes.
+Ported from the Rust oracle (the `GetNextRecord` streaming approach) and
+**verified live on rivsem04**: `Query(materializeBlobs: true)` returns real
+memo/blob content (Memo → `string`, Blob/Graphic → `byte[]`) — including
+`SELECT *` on wide tables and a 700-row run (no `0x2303` at scale). The old
+`0x3A9A` was never a cursor preamble; it was the slot packing the *column
+ordinal* where the server wants the row's *physical record number*. The
+`SELECT *`/scale faults the first cut had are solved by streaming, which
+takes each row's slot straight from `GetNextRecord` and frees buffers with
+the server's echoed slot bytes. See `PLAN.md` §9 for the full write-up.
 
-**Hypothesis:** DBSYS sends `ResetStatement (0x0334) + BeginDML (0x0316)`
-*before* `PrepareStatement`, and uses single-row scrolling (`GetNextRecord`
-0x00FA / `GetPriorRecord` 0x0104 / `SetToBookmark` 0x0154) instead of our
-batched `ReadFirstRecordBlock`. We don't do either.
+```powershell
+$env:DBISAM_HOST="rivsem04"; $env:DBISAM_USER="e3user"; $env:DBISAM_PASSWORD="e3usernew"
+$env:DBISAM_PROBE_BLOBS="1"; $env:EM_BLOB_DEBUG="1"   # EM_BLOB_DEBUG optional, per-row trace
+dotnet test --filter "FullyQualifiedName~FetchBlob_NIINGRED_Materialized"
+```
 
-**Resume from:**
-- `ExportKing.Tests/IntegrationSmokeTests.cs::FetchBlob_DbsysSequence_Probe`
-  — closest existing experiment.
-- Capture DBSYS on rivsem04 doing the **same SQL** you want ExportKing to
-  serve (not the grid flow that's in `dbisam-capture-memo.pcapng`).
-- Diff the captured C→S sequence against what ExportKing sends, fill in
-  the missing preamble messages.
+**Lifecycle constraint:** one `DbisamClient` per query — reusing a client
+for a second query after a streaming blob query desyncs the session. Open a
+fresh client per query (matches the oracle and `OdbcConnection`).
 
-**Safety note (matters):** A malformed OpenBlob crashed `dbsrvr.exe` once.
-Restart was needed. All blob probe tests are double-gated behind
-`DBISAM_PROBE_BLOBS=1`; keep that gate. After each experimental run, probe
-the server with `Test-NetConnection rivsem04 -Port 12005` (or the Linux
-equivalent) before sending another variant.
-
-**When it works:** flip `materializeBlobs:true` in `DbisamClient.Query`
-from `throw new NotImplementedException(…)` to actually doing the fetch
-loop. The hook is already there in `MaterializeBlobsInPlace`.
+**Safety note (still matters):** a malformed OpenBlob crashed `dbsrvr.exe`
+once. Blob probes stay double-gated behind `DBISAM_PROBE_BLOBS=1`; after an
+experimental variant, check `Test-NetConnection rivsem04 -Port 12005`
+before the next one.
 
 ---
 
@@ -114,6 +110,5 @@ Leave `EMUpdater` alone — it's on the XML-RPC path, out of scope.
 
 ---
 
-**One-line summary:** Move dev to rivsem04 → finish blob fetch by replaying
-the DBSYS preamble → build ADO.NET surface → migrate RocsMiddleware
-consumers.
+**One-line summary:** Blob fetch ✅ (streaming, incl. `SELECT *` and at
+scale) → build ADO.NET surface → migrate RocsMiddleware consumers.

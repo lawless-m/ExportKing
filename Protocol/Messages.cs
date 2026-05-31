@@ -31,6 +31,7 @@ public static class Reqcode
 
     public const ushort OpenBlob = 0x0280;
     public const ushort FreeBlob = 0x028A;
+    public const ushort FreeAllBlobs = 0x0294;
 
     public const ushort Receive = 0x030C;
     public const ushort DataDirCtor = 0x0316;
@@ -295,13 +296,25 @@ public static class Messages
         => new MsgBuilder(Reqcode.SetToBegin).PackU32(cursorHandle).Finish();
 
     /// <summary>
-    /// GetNextRecord (reqcode 0x00FA). Single-row cursor scroll. Required
-    /// before OpenBlob — the server uses the cursor's current position to
-    /// authorise the blob lookup, even though the slot also carries an MD5
-    /// hash and PK identifying the row.
+    /// GetNextRecord (reqcode 0x00FA). Advances the cursor and returns up to
+    /// <paramref name="counter"/> rows, each as
+    /// <c>[u16 result_code][10 cursor-info units][slot]</c> where the slot is
+    /// the row in physical-record-bookmark form (usable directly as the
+    /// <c>0x0280</c> OpenBlob slot). This is the streaming blob-fetch driver —
+    /// it lets the server advance through and free materialised rows as we go,
+    /// avoiding the <c>0x2303</c> the batched path hits at scale. The
+    /// <paramref name="bookmark"/> is echoed from the previous response's
+    /// cursor-info (seed it from SetToBegin's response).
+    /// Body: <c>cursor_handle u32 | bookmark | u8 0 | u8 0 | counter u32</c>.
     /// </summary>
-    public static byte[] BuildGetNextRecord(uint cursorHandle)
-        => new MsgBuilder(Reqcode.GetNextRecord).PackU32(cursorHandle).Finish();
+    public static byte[] BuildGetNextRecord(uint cursorHandle, ReadOnlySpan<byte> bookmark, uint counter)
+        => new MsgBuilder(Reqcode.GetNextRecord)
+            .PackU32(cursorHandle)
+            .Pack(bookmark)
+            .PackU8(0x00)
+            .PackU8(0x00)
+            .PackU32(counter)
+            .Finish();
 
     /// <summary>
     /// ReadFirstRecordBlock (reqcode 0x050A). Batched "position-at-start +
@@ -354,122 +367,76 @@ public static class Messages
         => new MsgBuilder(Reqcode.RemoveAllRemoteMemoryTables).Finish();
 
     /// <summary>
-    /// OpenBlob / blob-read (reqcode 0x0280). Fetches the actual content
-    /// of a memo/blob/graphic column whose row data only carried an 8-byte
-    /// handle. See protocol §6a.
+    /// OpenBlob / blob-read (reqcode 0x0280). Fetches the actual content of a
+    /// memo/blob/graphic column whose row data only carried an 8-byte handle.
+    /// See protocol §6a. Ported from the working Rust reference
+    /// (<c>exportmaster/msg.rs::build_open_blob</c>).
     ///
-    /// Request layout (4 Pack units after the standard header):
+    /// Request layout (6 Pack units after the standard 7-byte header):
     /// <code>
     /// Pack [u32 cursor_handle]
-    /// Pack [u32 col_ordinal]      1-based column index of the blob field
-    /// Pack [2 bytes 02 00]        opaque tag from capture analysis
-    /// Pack [slot_content]         slot_length bytes:
-    ///                               16 bytes row MD5 hash
-    ///                               1 byte   0x01 (not-null marker)
-    ///                               1 byte   PK length
-    ///                               N bytes  PK bytes
-    ///                               (padded to 8-byte multiple with zeros)
+    /// Pack [u16 field_ord]        1-based column ordinal of the blob field (2 bytes LE)
+    /// Pack [slot]                 the row's physical-record bookmark — build via Blob.BuildSlot
+    /// Pack [u8 force_reread]      0 = allow the server's cached buffer
+    /// Pack [u8 is_physical]       0 = GetField path (vs GetPhysicalField)
+    /// Pack [u8 0]                 vestigial; the official client always sends it
     /// </code>
+    ///
+    /// Note the slot carries the row's <em>physical record number</em>, not
+    /// the column ordinal — those are distinct, and conflating them was the
+    /// original 0x3A9A bug. The column ordinal travels only in the
+    /// <paramref name="fieldOrd"/> unit.
     /// </summary>
     public static byte[] BuildOpenBlob(
         uint cursorHandle,
-        uint colOrdinal,
-        ReadOnlySpan<byte> rowMd5,
-        ReadOnlySpan<byte> primaryKey,
-        int pkFieldWidth = 14)
+        ushort fieldOrd,
+        ReadOnlySpan<byte> slot,
+        byte forceReread = 0,
+        byte isPhysical = 0)
     {
-        if (rowMd5.Length != 16)
-            throw new ArgumentException("rowMd5 must be 16 bytes", nameof(rowMd5));
-        if (primaryKey.Length > pkFieldWidth)
-            throw new ArgumentException($"primaryKey {primaryKey.Length} bytes exceeds field width {pkFieldWidth}", nameof(primaryKey));
-
-        // Structure derived from byte-for-byte analysis of a real DBSYS
-        // OpenBlob request (capture: Derek/dbisam-capture-memo.pcapng, msg #9).
-        // The body is 3 outer Pack units followed by a 15-byte inner trailer
-        // and a 5-byte outer trailer (both constant across observed calls).
-        //
-        //   Pack(4)  cursor_handle              8 bytes
-        //   Pack(2)  tag = 02 00                6 bytes
-        //   Pack(56) slot                      60 bytes
-        //   inner trailer (15 bytes raw)
-        //   outer trailer (5 bytes, outside inner_len)
-        //
-        // Slot (56 bytes):
-        //   +00     00                          leading null
-        //   +01-04  col_ord u32 LE
-        //   +05-08  col_ord u32 LE  (duplicate)
-        //   +09-24  16-byte row MD5 hash
-        //   +25     01                          not-null flag for the PK
-        //   +26-..  PK bytes, null-padded to pkFieldWidth bytes total
-        //   +40-43  00 00 00 01
-        //   +44-47  col_ord u32 LE  (third time)
-        //   +48-51  col_ord u32 LE  (fourth time)
-        //   +52-55  00 00 00 00
-        // The PK field width in the observed capture is 14 (NIEAN max). For
-        // other tables this will differ — the caller passes pkFieldWidth.
-
-        const int SlotLength = 56;
-        // 15 + 5 trailer bytes verified verbatim across both OpenBlob calls
-        // in dbisam-capture-memo.pcapng.
-        ReadOnlySpan<byte> innerTrailer = stackalloc byte[]
-        {
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x00, 0x00,
-        };
-        ReadOnlySpan<byte> outerTrailer = stackalloc byte[]
-        {
-            0x00, 0x00, 0x01, 0x00, 0x00,
-        };
-
-        int innerLen = 8 + 6 + 4 + SlotLength + innerTrailer.Length;
-        var body = new byte[3 + 4 + innerLen + outerTrailer.Length];
-        body[0] = 0x00;
-        body[1] = 0x80;
-        body[2] = 0x02;
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(3, 4), (uint)innerLen);
-
-        int off = 7;
-
-        // Pack(4) cursor_handle
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(off, 4), 4); off += 4;
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(off, 4), cursorHandle); off += 4;
-
-        // Pack(2) tag = 02 00
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(off, 4), 2); off += 4;
-        body[off++] = 0x02;
-        body[off++] = 0x00;
-
-        // Pack(56) slot
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(off, 4), SlotLength); off += 4;
-        int slotStart = off;
-        body[slotStart + 0] = 0x00;
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(slotStart + 1, 4), colOrdinal);
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(slotStart + 5, 4), colOrdinal);
-        rowMd5.CopyTo(body.AsSpan(slotStart + 9, 16));
-        body[slotStart + 25] = 0x01;
-        // PK bytes at +26, null-padded to pkFieldWidth (rest of slot stays 0).
-        primaryKey.CopyTo(body.AsSpan(slotStart + 26, primaryKey.Length));
-        // +40..+43 = 00 00 00 01
-        body[slotStart + 43] = 0x01;
-        // +44..+47 = col_ord, +48..+51 = col_ord
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(slotStart + 44, 4), colOrdinal);
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(slotStart + 48, 4), colOrdinal);
-        // +52..+55 already zero.
-        off += SlotLength;
-
-        // Inner trailer + outer trailer.
-        innerTrailer.CopyTo(body.AsSpan(off, innerTrailer.Length));
-        off += innerTrailer.Length;
-        outerTrailer.CopyTo(body.AsSpan(off, outerTrailer.Length));
-
-        return body;
+        Span<byte> fieldOrdBytes = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(fieldOrdBytes, fieldOrd);
+        return new MsgBuilder(Reqcode.OpenBlob)
+            .PackU32(cursorHandle)
+            .Pack(fieldOrdBytes)
+            .Pack(slot)
+            .PackU8(forceReread)
+            .PackU8(isPhysical)
+            .PackU8(0)
+            .Finish();
     }
 
     /// <summary>
-    /// FreeBlob (reqcode 0x028A). Short ACK after a blob read — the captured
-    /// flows include it, body unverified. Sent as Pack(cursor_handle) to
-    /// match the single-handle pattern; adjust if the server complains.
+    /// FreeBlob (reqcode 0x028A). Releases the server-side blob buffer after
+    /// an OpenBlob read. 4 Pack units: <c>cursor_handle u32 | field_ord u16 |
+    /// slot | u8 flag</c>. The <paramref name="slot"/> MUST be the
+    /// <see cref="Blob.BlobFetchOutcome.SlotEcho"/> the server returned from
+    /// OpenBlob — not the request slot. The server tags a few trailing slot
+    /// bytes as an "open in cache" marker; FreeBlob has to present those exact
+    /// bytes or the buffer is never found and the per-cursor blob cache fills
+    /// up, eventually corrupting OpenBlob responses (<c>0x2303</c>).
     /// </summary>
-    public static byte[] BuildFreeBlob(uint cursorHandle)
-        => new MsgBuilder(Reqcode.FreeBlob).PackU32(cursorHandle).Finish();
+    public static byte[] BuildFreeBlob(uint cursorHandle, ushort fieldOrd, ReadOnlySpan<byte> slot, byte flag = 0)
+    {
+        Span<byte> fieldOrdBytes = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(fieldOrdBytes, fieldOrd);
+        return new MsgBuilder(Reqcode.FreeBlob)
+            .PackU32(cursorHandle)
+            .Pack(fieldOrdBytes)
+            .Pack(slot)
+            .PackU8(flag)
+            .Finish();
+    }
+
+    /// <summary>
+    /// FreeAllBlobs (reqcode 0x0294). Bulk-evicts every blob buffer in the
+    /// cursor's blob cache. The per-cursor cache is capacity-bounded (~640
+    /// entries observed) and <see cref="BuildFreeBlob"/> only decrements
+    /// use-count without forcing eviction; periodic FreeAllBlobs keeps a bulk
+    /// extract from filling the cache. Body: <c>cursor_handle u32 | u8 flag</c>.
+    /// The streaming path doesn't need it (the cursor advance frees rows), but
+    /// it's here for the batched path and parity with the reference.
+    /// </summary>
+    public static byte[] BuildFreeAllBlobs(uint cursorHandle, byte flag = 0)
+        => new MsgBuilder(Reqcode.FreeAllBlobs).PackU32(cursorHandle).PackU8(flag).Finish();
 }

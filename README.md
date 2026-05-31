@@ -37,6 +37,12 @@ This library fixes both by speaking DBISAM's TCP protocol directly:
 **In:**
 - `SELECT` queries
 - Connect + login + session setup + cursor fetch + cleanup
+- Memo/blob/graphic column content — `Query(materializeBlobs: true)` streams
+  rows via `GetNextRecord` and resolves each handle inline (`0x0280` OpenBlob
+  + `0x028A` FreeBlob per row); Memo → `string`, Blob/Graphic → `byte[]`.
+  Works on wide / multi-blob tables and at scale (no `0x2303` past ~644
+  fetches). Verified live against the Rust oracle — identical payload bytes
+  and row counts, including `SELECT *` and a 700-row run.
 - ADO.NET surface: `DbisamConnection`, `DbisamCommand`, `DbisamDataReader`,
   `DbisamConnectionStringBuilder`
 - Linux and Windows
@@ -48,10 +54,9 @@ This library fixes both by speaking DBISAM's TCP protocol directly:
 - Transactions
 - Connection pooling
 - Parameterised queries (initial cut — add if a consumer needs them)
-- Memo/blob columns — return the 8-byte server-side handle as `byte[]`.
-  Content fetch is partially implemented (`Messages.BuildOpenBlob`
-  byte-matches a real DBSYS capture) but the cursor-state preamble the
-  server requires isn't pinned down yet. See `PLAN.md` §9 to resume.
+- Reusing one `DbisamClient` for multiple sequential queries — the lifecycle
+  is one client per query (matches the Rust oracle and the old
+  `OdbcConnection` usage). Open a fresh client per query.
 
 ## Drop-in usage
 

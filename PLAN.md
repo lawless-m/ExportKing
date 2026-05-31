@@ -125,44 +125,68 @@ or the lower-level `DbisamClient`) can happen as a separate task in
 `KeycloakUpdater`, `InvoiceExtractor`, `DLLTest`, `RocsTests`. `EMUpdater`
 stays on its XML-RPC path.
 
-### 9. Blob / memo fetch — deferred (cursor preamble unresolved)
+### 9. Blob / memo fetch — ✅ working (ported from the Rust oracle)
 
-**What works:**
-- `Messages.BuildOpenBlob` produces bytes that are **byte-for-byte
-  identical** to a real DBSYS `0x0280` request (verified offline by
-  `OpenBlobMatchesCaptureTest` against `Derek/dbisam-capture-memo.pcapng`
-  msg #9).
-- Slot structure decoded from the capture: leading `00`, col_ord packed
-  4× (twice early, twice in trailer), 16-byte row MD5, `0x01` not-null,
-  14-byte PK area null-padded to the column's `max` width, then constant
-  16 bytes of trailer including col_ord twice more.
-- Outer message has 3 Pack units (cursor_handle, `02 00` tag, slot) plus
-  a constant 15-byte inner trailer and 5-byte outer trailer.
+**Root cause of the old `0x3A9A` (the preamble hypothesis was wrong):**
+there is **no** missing `ResetStatement + BeginDML` preamble and no
+single-row scrolling. Blob fetch runs on the *same already-open batched
+cursor* (handle 1), after the row scan, before `CloseCursor`. The actual
+bug was the **slot contents**: the old `BuildOpenBlob` packed the blob
+column's *ordinal* into the slot's repeated 4-byte field, where the server
+expects the row's **physical record number**. The old capture test only
+ever passed because that one capture row's physical number (5) happened to
+equal the `colOrdinal` (5) it was fed; the row's real blob ordinal is 2
+(the `02 00` "tag", which is actually `field_ord`).
 
-**What doesn't work yet:**
-- Live `0x0280` against rivsem04 returns server error reqcode `0x3A9A`
-  regardless of cursor state (open or closed) or PK width.
-- `GetNextRecord (0x00FA)` on the same cursor handle (1) returns the
-  same `0x3A9A` — so this is a broader cursor-state problem, not blob
-  specific. Likely missing the DBSYS preamble:
-  `ResetStatement (0x0334) + BeginDML (0x0316)` before `Prepare`, and
-  possibly single-row scrolling mode rather than batched
-  `ReadFirstRecordBlock`.
-- A second capture using ExportKing's own SQL (not the DBSYS grid flow)
-  is the most direct way to pin this down.
+**The working path — `GetNextRecord` streaming (mirrors MrsFlow
+`query_to_table_streaming`).** An earlier batched approach
+(`ReadFirstRecordBlock` + deferred `OpenBlob` per handle) materialised
+correctly for small explicit-column queries but had two faults that the
+oracle hit too: `SELECT *` on wide cursors returned empty payloads (the
+per-row bookmark stride is 39 bytes there, not 22, so the phys-at-offset-18
+extraction read garbage), and at scale the server returned `0x2303` after
+~644 OpenBlobs against the up-front-materialised set. Both are gone with
+streaming, which is now the path `Query(materializeBlobs: true)` uses:
 
-**Risk:** an early variant of `BuildOpenBlob` crashed `dbsrvr.exe` (the
-listener stopped accepting until manual restart). Server has been stable
-under the byte-perfect shape and the GetNextRecord experiment. Probes are
-double-gated (`DBISAM_HOST` + `DBISAM_PROBE_BLOBS=1`).
+- `DbisamClient.DriveStreamingWithBlobs`: ExecuteStatement → Receive-poll →
+  SetToBegin (its response seeds the first bookmark) → loop
+  `GetNextRecord(handle, bookmark, ~50)`. Each response packs rows as
+  `[u16 result_code][10 cursor-info units][slot]`; the **slot is the row in
+  physical-record-bookmark form**, so it's both decoded for columns
+  (`Row.DecodeRecord(slot)`) *and* passed verbatim to `0x0280` — no phys
+  reconstruction, which is why the 22-vs-39 stride problem disappears. The
+  last row's cursor-info bookmark seeds the next `GetNextRecord`; the loop
+  ends on `result_code = 0x2202`.
+- Per blob handle: `0x0280` OpenBlob then `0x028A` FreeBlob using
+  **`BlobFetchOutcome.SlotEcho`** (the server-modified slot bytes — e.g.
+  `01 fe ff ff ff`). Freeing with the request slot instead of the echo
+  leaves buffers un-freed and the per-cursor blob cache fills → `0x2303`.
+- `Messages.BuildOpenBlob(cursorHandle, fieldOrd, slot)` is 6 clean Pack
+  units (`field_ord` is its own unit, distinct from the slot's phys).
+  `Blob.ParseOpenBlobResponse` reads the 3-unit reply (slot echo,
+  `<u32 size>`, payload) and surfaces the echo for FreeBlob.
 
-**Resume from:**
-- `IntegrationSmokeTests.FetchBlob_DbsysSequence_Probe` — closest to the
-  DBSYS sequence; needs adding `ResetStatement`+`BeginDML` preamble and
-  iterating.
-- `Protocol/OpenBlobMatchesCaptureTest` — proves the bytes; don't break it.
-- Development will move to `rivsem04` so captures can be taken alongside
-  the C# code changes (the only way to learn the right preamble).
+`Blob.BuildSlot` / `PhysicalRecordNumberFromBookmark` and the per-row
+bookmark plumbing in `Response.cs`/`Cursor.cs` remain (unit-tested, mirror
+the oracle), but the streaming path doesn't need them — they're there for
+the legacy batched route and the codec tests.
+
+**Verified live against rivsem04** (`FetchBlob_NIINGRED_Materialized`),
+byte-for-byte against the Rust oracle:
+- `SELECT NIEAN, NIINGREDS FROM NIINGRED TOP 5` and `SELECT * … TOP 5` —
+  payloads 280/257/235/393/88, real ingredient text.
+- `SELECT NIEAN, NIINGREDS … TOP 700` — 700 rows, 575 with a memo, no
+  `0x2303`. Set `EM_BLOB_DEBUG=1` for per-row tracing.
+
+**Lifecycle:** one `DbisamClient` per query. Reusing a client for a second
+query after a streaming blob query desyncs the session (the streaming
+teardown differs from the batched cursor's). Open a fresh client per query —
+matches the oracle (one connection per query) and the `OdbcConnection` model.
+
+**Risk note:** an early malformed `BuildOpenBlob` crashed `dbsrvr.exe`
+once. The byte-perfect shape has been stable across many runs (incl. the
+700-row extract); the end-to-end test stays double-gated (`DBISAM_HOST` +
+`DBISAM_PROBE_BLOBS=1`).
 
 ## Test environment
 

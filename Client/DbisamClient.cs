@@ -34,8 +34,9 @@ public sealed class QueryResult
     public required IReadOnlyList<object?[]> Rows { get; init; }
     /// <summary>
     /// One 16-byte MD5 hash per row, in the same order as <see cref="Rows"/>.
-    /// Required as input to <see cref="DbisamClient.FetchBlob"/> — the hash
-    /// disambiguates which row's blob to fetch on the server.
+    /// Forms part of the blob-fetch slot (see <see cref="Blob.BuildSlot"/>);
+    /// surfaced here for callers that materialise blobs manually rather than
+    /// via <c>Query(materializeBlobs: true)</c>.
     /// </summary>
     public required IReadOnlyList<byte[]> RowHashes { get; init; }
 }
@@ -103,27 +104,18 @@ public sealed class DbisamClient : IDisposable
     /// chain (CloseCursor → ResetStatement → RemoveAllRemoteMemoryTables)
     /// runs unconditionally so a subsequent query on the same session works.
     ///
-    /// When <paramref name="materializeBlobs"/> is true, each memo/blob/graphic
-    /// column with a non-zero handle is fetched inline before cleanup — Memo
-    /// cells become <see cref="string"/>, Blob/Graphic cells become <see cref="byte"/>[].
-    /// Blob fetch requires an open cursor (server-side), so it has to happen
-    /// before the CloseCursor in the cleanup chain.
+    /// When <paramref name="materializeBlobs"/> is true and the result has any
+    /// memo/blob/graphic column, the query streams via <c>GetNextRecord</c>
+    /// (0x00FA) and resolves each non-zero handle inline (OpenBlob + FreeBlob
+    /// per row) — Memo cells become <see cref="string"/>, Blob/Graphic cells
+    /// become <see cref="byte"/>[]. Streaming (rather than the batched
+    /// ReadRecordBlock path) is required at scale: the batched path
+    /// materialises every row up front and the server returns <c>0x2303</c>
+    /// once the OpenBlob count climbs past a few hundred. Non-blob queries use
+    /// the faster batched path unchanged.
     /// </summary>
     public QueryResult Query(string sql, bool materializeBlobs = false, int targetRows = int.MaxValue)
     {
-        if (materializeBlobs)
-        {
-            // Blob fetch is implemented at the byte level (BuildOpenBlob
-            // matches the DBSYS capture exactly — see OpenBlobMatchesCaptureTest)
-            // but the surrounding cursor preamble needed to make the server
-            // accept it (and accept GetNextRecord on the same cursor) hasn't
-            // been pinned down yet. See PLAN.md phase 9 for the open work.
-            throw new NotImplementedException(
-                "materializeBlobs=true is not yet wired end-to-end. The OpenBlob " +
-                "request bytes are correct but the surrounding cursor state isn't. " +
-                "See PLAN.md and FetchBlob_DbsysSequence_Probe in the integration tests.");
-        }
-
         var schemaResp = QueryRaw(sql);
         List<Column> columns;
         try
@@ -139,21 +131,25 @@ public sealed class DbisamClient : IDisposable
                 $"first {head.Length} bytes: {Convert.ToHexString(head)})", ex);
         }
 
+        bool hasBlobs = materializeBlobs && columns.Any(c =>
+            c.FieldType is FieldType.Blob or FieldType.Memo or FieldType.Graphic);
+
         var rows = new List<object?[]>();
         var rowHashes = new List<byte[]>();
         try
         {
-            Cursor.DriveCursor(_stream, columns, targetRows, _opts.BatchSize, fullRecord =>
+            if (hasBlobs)
             {
-                var cells = Row.DecodeRecord(fullRecord, columns);
-                var hash = Row.ExtractRecordHash(fullRecord);
-                if (materializeBlobs)
+                DriveStreamingWithBlobs(columns, targetRows, rows, rowHashes);
+            }
+            else
+            {
+                Cursor.DriveCursor(_stream, columns, targetRows, _opts.BatchSize, (fullRecord, _) =>
                 {
-                    MaterializeBlobsInPlace(cells, columns, hash);
-                }
-                rows.Add(cells);
-                rowHashes.Add(hash);
-            });
+                    rows.Add(Row.DecodeRecord(fullRecord, columns));
+                    rowHashes.Add(Row.ExtractRecordHash(fullRecord));
+                });
+            }
         }
         finally
         {
@@ -166,91 +162,151 @@ public sealed class DbisamClient : IDisposable
     }
 
     /// <summary>
-    /// Replace each blob/memo cell's 8-byte handle with the actual content.
-    /// Assumes the first column is the PK (DBISAM convention per §6a impl note).
-    /// </summary>
-    private void MaterializeBlobsInPlace(object?[] cells, IReadOnlyList<Column> columns, byte[] hash)
-    {
-        if (cells.Length == 0 || cells[0] is not string pkStr) return;
-        var pkBytes = Encoding.ASCII.GetBytes(pkStr);
-        for (int i = 0; i < columns.Count; i++)
-        {
-            if (cells[i] is not byte[] handle || handle.Length != 8 || handle.All(b => b == 0)) continue;
-            var ft = columns[i].FieldType;
-            if (ft != FieldType.Memo && ft != FieldType.Blob && ft != FieldType.Graphic) continue;
-
-            var blob = FetchBlob((uint)columns[i].Ord, hash, pkBytes);
-            if (blob is null) continue;
-
-            cells[i] = ft == FieldType.Memo ? Encoding.ASCII.GetString(blob) : (object)blob;
-        }
-    }
-
-    /// <summary>
-    /// Fetch the actual content of a memo/blob/graphic column for one row.
-    /// Sends an <c>OpenBlob (0x0280)</c> request and parses the payload out
-    /// of the response. Caller supplies the column ordinal (1-based — see
-    /// <see cref="Column.Ord"/>), the row's MD5 hash (from
-    /// <see cref="Row.ExtractRecordHash"/> or <see cref="QueryResult.RowHashes"/>),
-    /// and the row's PK bytes (typically the first column's value).
+    /// Stream rows via <c>GetNextRecord</c> (0x00FA), resolving blob columns
+    /// inline. Mirrors the Rust reference's <c>query_to_table_streaming</c>.
+    /// Each GetNextRecord response packs multiple rows, each as
+    /// <c>[u16 result_code][10 cursor-info units][slot]</c>; the slot is the
+    /// row in physical-record-bookmark form, usable directly as the OpenBlob
+    /// slot (so no phys reconstruction is needed). The last row's bookmark
+    /// seeds the next GetNextRecord; the loop ends on result_code 0x2202.
     ///
-    /// Returns the blob bytes, or null if the response didn't contain a
-    /// recognisable blob payload (server returned an error reqcode).
+    /// Assumes <see cref="QueryRaw"/> already prepared the statement.
     /// </summary>
-    public byte[]? FetchBlob(uint colOrdinal, ReadOnlySpan<byte> rowMd5, ReadOnlySpan<byte> primaryKey)
+    private void DriveStreamingWithBlobs(
+        IReadOnlyList<Column> columns, int targetRows,
+        List<object?[]> rows, List<byte[]> rowHashes)
     {
-        var req = Messages.BuildOpenBlob(Cursor.CursorHandle, colOrdinal, rowMd5, primaryKey);
-        var resp = Framing.SendRecv(_stream, req);
-        return ExtractBlobPayload(resp);
-    }
+        bool debug = Environment.GetEnvironmentVariable("EM_BLOB_DEBUG") is not null;
+        int firstOff = columns[0].RowOffset;
+        int colEndOffset = Cursor.ComputeRecordSize(columns);
+        const uint handle = Cursor.CursorHandle;
 
-    /// <summary>
-    /// Like <see cref="FetchBlob"/> but also returns the full raw response
-    /// bytes — used for debugging when the parsed payload comes back null.
-    /// </summary>
-    internal byte[] FetchBlobRaw(uint colOrdinal, ReadOnlySpan<byte> rowMd5, ReadOnlySpan<byte> primaryKey)
-    {
-        var req = Messages.BuildOpenBlob(Cursor.CursorHandle, colOrdinal, rowMd5, primaryKey);
-        return Framing.SendRecv(_stream, req);
-    }
-
-    /// <summary>The same request the client would send for the given blob handle. Exposed for debugging.</summary>
-    internal static byte[] DebugBuildOpenBlob(uint colOrdinal, ReadOnlySpan<byte> rowMd5, ReadOnlySpan<byte> pk)
-        => Messages.BuildOpenBlob(Cursor.CursorHandle, colOrdinal, rowMd5, pk);
-
-    /// <summary>
-    /// Walk the body's Pack stream and find the largest unit whose first
-    /// 4 bytes look like a Delphi double-length prefix ([u32 actual][u32 max]
-    /// where actual == max). Per protocol §6a: "somewhere in the body the
-    /// blob payload appears as Delphi-style length-prefixed".
-    /// </summary>
-    private static byte[]? ExtractBlobPayload(byte[] body)
-    {
-        if (body.Length < Response.PackStreamOffset) return null;
-        // Error reqcodes: 0x2EAD (SQL parse), 0x2B02/0x2B05 (DDL/exec), etc.
-        // We can't enumerate them all; if no blob unit found, return null.
-        var walker = new Walker(body, Response.PackStreamOffset);
-        byte[]? best = null;
-        while (true)
+        // Phase 1: ExecuteStatement + Receive poll until the cursor materialises.
+        var resp = Framing.SendRecv(_stream, Messages.BuildExecuteStatement(handle));
+        for (int polls = 0; IsNotReady(resp); polls++)
         {
-            ReadOnlyMemory<byte>? unit;
-            try { unit = walker.NextUnit(); } catch (IOException) { break; }
-            if (unit is null) break;
-            var u = unit.Value;
-            // A blob unit's first 8 bytes are [u32 actual_len][u32 max_len]
-            // with actual_len == max_len. Total unit size = 8 + actual_len.
-            if (u.Length >= 8)
-            {
-                uint actual = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(u.Span.Slice(0, 4));
-                uint max = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(u.Span.Slice(4, 4));
-                if (actual == max && actual > 0 && 8 + actual == u.Length)
-                {
-                    var content = u.Span.Slice(8, (int)actual).ToArray();
-                    if (best is null || content.Length > best.Length) best = content;
-                }
-            }
+            if (polls >= 600)
+                throw new IOException($"Exportmaster: cursor still 'not ready' after {polls} Receive polls");
+            resp = Framing.SendRecv(_stream, Messages.BuildReceive());
         }
-        return best;
+
+        // Phase 2: SetToBegin. Its response carries the first row's bookmark in
+        // cursor-info — and, unlike GetNextRecord, has NO leading result-code
+        // unit, so the 10 cursor-info units start at PackStreamOffset.
+        var setBeginResp = Framing.SendRecv(_stream, Messages.BuildSetToBegin(handle));
+        byte[] nextBookmark = CursorInfo.Read(new Walker(setBeginResp, Response.PackStreamOffset)).Bookmark;
+
+        // Phase 3: GetNextRecord loop.
+        uint requestBatch = Math.Clamp(_opts.BatchSize, 1u, 50u); // ODBC uses ~50
+        while (rows.Count < targetRows)
+        {
+            var body = Messages.BuildGetNextRecord(handle, nextBookmark, requestBatch);
+            var batchResp = Framing.SendRecv(_stream, body);
+            var walker = new Walker(batchResp, Response.PackStreamOffset);
+            bool gotEoc = false;
+            int rowsInBatch = 0;
+
+            while (rows.Count < targetRows)
+            {
+                // A GetNextRecord response can end with a trailing partial
+                // unit; like the reference, break on any read error or clean
+                // exhaustion (the next GetNextRecord starts a fresh response).
+                ReadOnlyMemory<byte>? rcUnit, slotUnit;
+                CursorInfo cursorInfo;
+                try
+                {
+                    rcUnit = walker.NextUnit();
+                    if (rcUnit is null || rcUnit.Value.Length != 2) break;
+                    ushort resultCode = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(rcUnit.Value.Span);
+                    if (resultCode == Response.ResultEndOfCursor) { gotEoc = true; break; }
+                    if (resultCode != Response.ResultOk) break;
+
+                    cursorInfo = CursorInfo.Read(walker);
+                    slotUnit = walker.NextUnit();
+                }
+                catch (IOException) { break; }
+                if (slotUnit is null || slotUnit.Value.Length < colEndOffset) break;
+                var slot = slotUnit.Value.ToArray();
+
+                var cells = Row.DecodeRecord(slot, columns);
+                for (int i = 0; i < columns.Count; i++)
+                {
+                    var ft = columns[i].FieldType;
+                    if (ft is not (FieldType.Blob or FieldType.Memo or FieldType.Graphic)) continue;
+                    if (cells[i] is not byte[] h || h.Length != 8 || h.All(b => b == 0)) { cells[i] = null; continue; }
+
+                    var fieldOrd = (ushort)(i + 1);
+                    var outcome = FetchBlob(fieldOrd, slot);
+                    if (debug)
+                    {
+                        Console.Error.WriteLine(
+                            $"[em-blob] row={rows.Count} col={i} field_ord={fieldOrd} " +
+                            $"-> payload={outcome?.Payload.Length.ToString() ?? "null"} " +
+                            $"server_slot_len={outcome?.ActualSlotLength.ToString() ?? "null"}");
+                    }
+                    if (outcome is null)
+                    {
+                        throw new IOException(
+                            $"Exportmaster: OpenBlob returned no payload for row {rows.Count} " +
+                            $"col {i} (field_ord={fieldOrd}) — likely a server error reqcode (e.g. 0x2303/0x3A9A).");
+                    }
+                    // Free the server-side buffer using the ECHOED slot bytes,
+                    // or the per-cursor blob cache fills and OpenBlob starts
+                    // returning 0x2303.
+                    try { _ = Framing.SendRecv(_stream, Messages.BuildFreeBlob(handle, fieldOrd, outcome.SlotEcho)); } catch { }
+
+                    cells[i] = ft == FieldType.Memo ? Encoding.ASCII.GetString(outcome.Payload) : outcome.Payload;
+                }
+
+                rows.Add(cells);
+                rowHashes.Add(Row.ExtractRecordHash(slot));
+                nextBookmark = cursorInfo.Bookmark;
+                rowsInBatch++;
+            }
+
+            if (gotEoc || rowsInBatch == 0) break;
+        }
+    }
+
+    /// <summary>
+    /// True if a response is the "cursor not ready, poll again" status — either
+    /// the body-header polling sentinel or an inner <c>RESULT_NOT_READY</c>.
+    /// </summary>
+    private static bool IsNotReady(byte[] body)
+    {
+        if (Response.BodyReqcode(body) == Response.PollingSentinelReqcode) return true;
+        int p = Response.PackStreamOffset;
+        if (body.Length < p + 6) return false;
+        if (System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(p, 4)) != 2) return false;
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(p + 4, 2)) == Response.ResultNotReady;
+    }
+
+    /// <summary>
+    /// Fetch the content of one memo/blob/graphic column for one row. Sends an
+    /// <c>OpenBlob (0x0280)</c> request and parses the 3-unit response.
+    /// <paramref name="fieldOrd"/> is the blob column's 1-based ordinal (see
+    /// <see cref="Column.Ord"/>); <paramref name="slot"/> is the row's
+    /// physical-record bookmark from <see cref="Blob.BuildSlot"/>.
+    ///
+    /// Returns the parsed outcome (payload + the server's expected slot
+    /// length), or null if the response wasn't a recognisable blob reply
+    /// (server returned an error reqcode).
+    /// </summary>
+    public Blob.BlobFetchOutcome? FetchBlob(ushort fieldOrd, ReadOnlySpan<byte> slot)
+    {
+        var req = Messages.BuildOpenBlob(Cursor.CursorHandle, fieldOrd, slot);
+        var resp = Framing.SendRecv(_stream, req);
+        return Blob.ParseOpenBlobResponse(resp);
+    }
+
+    /// <summary>
+    /// Like <see cref="FetchBlob"/> but returns the full raw response bytes —
+    /// used for debugging when the parsed outcome comes back null.
+    /// </summary>
+    internal byte[] FetchBlobRaw(ushort fieldOrd, ReadOnlySpan<byte> slot)
+    {
+        var req = Messages.BuildOpenBlob(Cursor.CursorHandle, fieldOrd, slot);
+        return Framing.SendRecv(_stream, req);
     }
 
     public void Dispose()
