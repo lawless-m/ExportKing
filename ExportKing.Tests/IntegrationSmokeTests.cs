@@ -1,4 +1,6 @@
+using System.Data;
 using ExportKing.Client;
+using ExportKing.Data;
 using ExportKing.Protocol;
 using Xunit;
 using Xunit.Abstractions;
@@ -315,6 +317,56 @@ public class IntegrationSmokeTests
             Assert.Equal(0, unresolved);
         }
         Assert.True(n > 0, "expected rows from NIINGRED");
+    }
+
+    /// <summary>
+    /// The drop-in ADO.NET path: <see cref="DbisamConnection"/> +
+    /// <see cref="DbisamCommand"/> + reader, the exact shape a migrated
+    /// <c>OdbcConnection</c> call site uses. No blobs here (RIGeographic),
+    /// so it exercises the surface without the probe gate.
+    /// </summary>
+    [Fact]
+    public void AdoNet_RIGeographic_DropIn()
+    {
+        var host = Environment.GetEnvironmentVariable("DBISAM_HOST");
+        if (string.IsNullOrEmpty(host)) { _out.WriteLine("Skipped: set DBISAM_HOST to run."); return; }
+        int port = int.Parse(Environment.GetEnvironmentVariable("DBISAM_PORT") ?? "12005");
+        var user = Environment.GetEnvironmentVariable("DBISAM_USER")!;
+        var password = Environment.GetEnvironmentVariable("DBISAM_PASSWORD")!;
+        var catalog = Environment.GetEnvironmentVariable("DBISAM_CATALOG") ?? "NISAINT_CS";
+
+        using var conn = new DbisamConnection(
+            $"Host={host};Port={port};User Id={user};Password={password};Catalog={catalog}");
+        Assert.Equal(ConnectionState.Closed, conn.State);
+        conn.Open();
+        Assert.Equal(ConnectionState.Open, conn.State);
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT CountryCode, RITerritoryCode FROM RIGeographic TOP 5";
+        int rows = 0;
+        using (var reader = cmd.ExecuteReader())
+        {
+            Assert.Equal(2, reader.FieldCount);
+            Assert.Equal("CountryCode", reader.GetName(0));
+            while (reader.Read())
+            {
+                var code = reader["CountryCode"]?.ToString()?.Trim() ?? "";
+                var terr = reader.GetString(reader.GetOrdinal("RITerritoryCode")).Trim();
+                _out.WriteLine($"  {code} -> {terr}");
+                Assert.NotEqual("", code);
+                rows++;
+            }
+        }
+        Assert.True(rows > 0, "expected rows from RIGeographic via the ADO.NET surface");
+
+        // ExecuteScalar convenience.
+        using var scalarCmd = new DbisamCommand("SELECT CountryCode FROM RIGeographic TOP 1", conn);
+        var first = scalarCmd.ExecuteScalar();
+        _out.WriteLine($"scalar: {first}");
+        Assert.IsType<string>(first);
+
+        // Writes are unsupported.
+        Assert.Throws<NotSupportedException>(() => new DbisamCommand("DELETE FROM RIGeographic", conn).ExecuteNonQuery());
     }
 
     private static bool ContainsBytes(byte[] haystack, byte[] needle)

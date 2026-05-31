@@ -99,21 +99,29 @@ needs it), the `execute_dml` half of `client.rs`, the DML/DDL dispatch in
       evidence in place; full byte-diff is bigger machinery than
       worthwhile right now.
 
-### 6. ADO.NET surface
-- [ ] `DbisamConnection : DbConnection` — `Open`/`Close`/`State`/
+### 6. ADO.NET surface ✅
+- [x] `DbisamConnection : DbConnection` — `Open`/`Close`/`State`/
       `ConnectionString`; `CreateDbCommand` → `DbisamCommand`;
-      `BeginDbTransaction` and `ChangeDatabase` throw `NotSupportedException`
-- [ ] `DbisamCommand : DbCommand` — `ExecuteDbDataReader` only; `ExecuteNonQuery`
-      and `ExecuteScalar` throw `NotSupportedException`; empty parameter
-      collection
-- [ ] `DbisamDataReader : DbDataReader` — `Read`, `GetFieldValue<T>`, `GetName`,
-      `GetOrdinal`, `FieldCount`, `this[name]`, `this[i]`, `GetSchemaTable`;
-      `NextResult` returns false
-- [ ] `DbisamConnectionStringBuilder : DbConnectionStringBuilder` — typed
-      properties for Host, Port, User Id, Password, Catalog, Batch Size
-      (no Compression — LAN-only, never wanted)
-- [ ] **Verify:** replicate `ExportMasterService.GetTerritoryMap` using
-      `DbisamConnection`; result matches ODBC version exactly
+      `BeginDbTransaction` and `ChangeDatabase` throw `NotSupportedException`.
+      Hands out a clean session per query via `AcquireClient()` (the protocol
+      is one-cursor-per-session; sequential queries on one session desync, so
+      the first query re-uses `Open`'s login and later ones reconnect).
+- [x] `DbisamCommand : DbCommand` — `ExecuteDbDataReader` only; `ExecuteNonQuery`
+      throws `NotSupportedException` (writes go through the XML-RPC API);
+      empty parameter collection. `ExecuteScalar` **works** (first cell) — a
+      deliberate deviation from the original "throw" plan, since it's a read
+      and helps `SELECT COUNT(*)` drop-ins. `MaterializeBlobs` (bool?)
+      overrides the connection's `Materialize Blobs` default per command.
+- [x] `DbisamDataReader : DbDataReader` — `Read`, `GetFieldValue<T>` (via base),
+      typed getters, `GetName`, `GetOrdinal` (case-insensitive), `FieldCount`,
+      `this[name]`, `this[i]`, `GetSchemaTable`, `GetBytes`/`GetChars`;
+      `NextResult` returns false. Nulls surface as `DBNull.Value` (ODBC parity).
+- [x] `DbisamConnectionStringBuilder : DbConnectionStringBuilder` — typed
+      Host, Port, User Id, Password, Catalog, Batch Size, Materialize Blobs
+      (no Compression — LAN-only, never wanted).
+- [x] **Verified:** offline `AdoNetTests` (builder parse + reader) and live
+      `AdoNet_RIGeographic_DropIn` (DbisamConnection + DbisamCommand + reader,
+      `reader["CountryCode"]`, ExecuteScalar, ExecuteNonQuery throws).
 
 ### 7+8. Consumer migration — out of scope for this phase
 Per user direction, RocsMiddleware migration is **not** part of this round

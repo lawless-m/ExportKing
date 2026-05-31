@@ -54,9 +54,11 @@ This library fixes both by speaking DBISAM's TCP protocol directly:
 - Transactions
 - Connection pooling
 - Parameterised queries (initial cut — add if a consumer needs them)
-- Reusing one `DbisamClient` for multiple sequential queries — the lifecycle
-  is one client per query (matches the Rust oracle and the old
-  `OdbcConnection` usage). Open a fresh client per query.
+
+> **Connection re-use:** the low-level `DbisamClient` is one query per session
+> (sequential queries on one client can desync). The ADO.NET `DbisamConnection`
+> hides this — it runs the first query on the `Open()` session and silently
+> reconnects for each later command, so multiple queries per connection work.
 
 ## Drop-in usage
 

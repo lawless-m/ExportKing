@@ -67,19 +67,28 @@ before the next one.
 
 ---
 
-## 3. ADO.NET surface (task #8 in `TaskList`)
+## 3. ADO.NET surface — ✅ DONE
 
-This unlocks drop-in replacement for `OdbcConnection` in RocsMiddleware.
-Currently consumers would have to use `DbisamClient.Query` directly,
-which works but loses Dapper/`DbDataReader` ecosystem compatibility.
+Drop-in replacement for `OdbcConnection` is built in `Data/`:
+`DbisamConnection`, `DbisamCommand`, `DbisamDataReader`,
+`DbisamConnectionStringBuilder` (+ internal `DbisamParameterCollection`).
+Verified offline (`AdoNetTests`) and live (`AdoNet_RIGeographic_DropIn`).
 
-Implement in `Data/`:
-- `DbisamConnection : DbConnection`
-- `DbisamCommand : DbCommand` (only `ExecuteDbDataReader` works; others throw)
-- `DbisamDataReader : DbDataReader`
-- `DbisamConnectionStringBuilder : DbConnectionStringBuilder`
+```csharp
+using var conn = new DbisamConnection("Host=rivsem04;User Id=e3user;Password=e3usernew;Catalog=NISAINT_CS");
+using var cmd  = new DbisamCommand("SELECT CountryCode FROM RIGeographic", conn);
+conn.Open();
+using var reader = cmd.ExecuteReader();
+while (reader.Read()) { var code = reader["CountryCode"]?.ToString()?.Trim() ?? ""; }
+```
 
-See `PLAN.md` §6 for the full method-by-method checklist.
+Gotchas for the migration: **one connection per query** (the connection
+reconnects for a 2nd command, so it works, but a fresh connection is
+cleaner); `ExecuteNonQuery` throws (writes stay on the XML-RPC path);
+memos materialise by default (`Materialize Blobs=false` to disable per
+connection, or `cmd.MaterializeBlobs=false` per command).
+
+See `PLAN.md` §6 for the method-by-method detail.
 
 ---
 
@@ -111,4 +120,5 @@ Leave `EMUpdater` alone — it's on the XML-RPC path, out of scope.
 ---
 
 **One-line summary:** Blob fetch ✅ (streaming, incl. `SELECT *` and at
-scale) → build ADO.NET surface → migrate RocsMiddleware consumers.
+scale), ADO.NET surface ✅ → migrate RocsMiddleware consumers (start with
+`X3CustomerPull/Services/ExportMasterService.cs`).
