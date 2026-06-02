@@ -85,20 +85,34 @@ public static class Blob
     }
 
     /// <summary>
-    /// Extract <c>PhysicalRecordNumber</c> from a 22-byte cursor bookmark unit.
-    /// The position is encoded at offset 18 as
-    /// <c>&lt;u8 with high bit set&gt;&lt;3 bytes BE value&gt;</c> — the §3
-    /// "high-bit-tagged integer" form. Strip the high bit and read the 4 bytes
-    /// big-endian.
+    /// Extract <c>PhysicalRecordNumber</c> from a per-row cursor bookmark unit.
+    /// The position is always the <b>trailing 4 bytes</b> of the bookmark,
+    /// encoded as <c>&lt;u8 with high bit set&gt;&lt;3 bytes BE value&gt;</c> —
+    /// the §3 "high-bit-tagged integer" form. Strip the high bit and read the
+    /// 4 bytes big-endian.
     ///
-    /// Returns 0 if the bookmark is too short or malformed (typical
-    /// non-natural-PK cursors don't carry a usable position here).
+    /// <para><b>Bookmark length is parametric on PK width</b>, not fixed at 22:</para>
+    /// <list type="bullet">
+    ///   <item>CUSTOMER (PK CODE max=11) → 17 bytes (1 + 11 + 1 + 4)</item>
+    ///   <item>NIINGRED (PK NIEAN max=14) → 22 bytes (1 + 14 + 2 pad + 1 + 4)</item>
+    ///   <item>Other tables → 1 + pk_width + [0..N pad] + 1 + 4</item>
+    /// </list>
+    ///
+    /// <para>The PHYS bytes are always the last 4, regardless of PK width or any
+    /// middle padding the server inserts. Reading from a hardcoded offset
+    /// (e.g. [18..22]) silently returns 0 on every table whose PK is shorter
+    /// than NIINGRED's 14 — observed against CUSTOMER on rivsem04, where this
+    /// broke the batched-cursor blob path entirely (every OpenBlob got a
+    /// phys=0 lookup and returned empty payload).</para>
+    ///
+    /// Returns 0 only when the bookmark is shorter than 4 bytes.
     /// </summary>
     public static uint PhysicalRecordNumberFromBookmark(ReadOnlySpan<byte> bookmark)
     {
-        if (bookmark.Length < 22) return 0;
-        byte b0 = (byte)(bookmark[18] & 0x7F);
-        return BinaryPrimitives.ReadUInt32BigEndian(stackalloc byte[] { b0, bookmark[19], bookmark[20], bookmark[21] });
+        if (bookmark.Length < 4) return 0;
+        int n = bookmark.Length;
+        byte b0 = (byte)(bookmark[n - 4] & 0x7F);
+        return BinaryPrimitives.ReadUInt32BigEndian(stackalloc byte[] { b0, bookmark[n - 3], bookmark[n - 2], bookmark[n - 1] });
     }
 
     /// <summary>

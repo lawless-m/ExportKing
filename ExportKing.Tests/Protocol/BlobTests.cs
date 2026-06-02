@@ -49,10 +49,10 @@ public class BlobTests
     }
 
     [Fact]
-    public void PhysicalRecordNumber_FromBookmark()
+    public void PhysicalRecordNumber_From22ByteNiingredBookmark()
     {
-        // Cursor bookmark (22 bytes) for the NIEAN="0071567747844" row carries
-        // phys=5 at bytes 18..22, encoded as 80 00 00 05 (high-bit-flagged BE).
+        // NIEAN="0071567747844" row's 22-byte cursor bookmark carries
+        // phys=5 at the trailing 4 bytes (80 00 00 05, high-bit-flagged BE).
         var bookmark = Convert.FromHexString(
             "0130303731353637373437383434000000" + // [0..17]
             "01" +                                  // [17]
@@ -62,11 +62,28 @@ public class BlobTests
     }
 
     [Fact]
+    public void PhysicalRecordNumber_From17ByteCustomerBookmark()
+    {
+        // CUSTOMER's 11-byte PK (CODE column max=11) produces a 17-byte
+        // bookmark: 1 flag + 11 PK + 1 marker + 4 phys, no middle pad.
+        // Live-captured from rivsem04 against `SELECT CODE, NOTES FROM
+        // CUSTOMER` where the first row has CODE="1" and phys=1.
+        //
+        // Regression: the old code hardcoded offset 18..22 and returned 0
+        // here, silently breaking every blob fetch on short-PK tables via
+        // the batched-cursor path.
+        // Bytes: 01 (PK flag) 31 (CODE="1") 00*10 (PK pad to 11) 01 (marker) 80 00 00 01 (phys=1)
+        var bookmark = Convert.FromHexString("0131000000000000000000000180000001");
+        Assert.Equal(17, bookmark.Length);
+        Assert.Equal(1u, Blob.PhysicalRecordNumberFromBookmark(bookmark));
+    }
+
+    [Fact]
     public void PhysicalRecordNumber_HandlesLargeValues()
     {
         var bookmark = new byte[22];
-        // PhysicalRecordNumber = 100000 = 0x000186A0; BE in bytes 19..22 with
-        // byte 18 high-bit set as the tag.
+        // PhysicalRecordNumber = 100000 = 0x000186A0; BE in trailing 4
+        // bytes (last byte's high bit is the flag).
         bookmark[18] = 0x80;
         bookmark[19] = 0x01;
         bookmark[20] = 0x86;
@@ -77,7 +94,8 @@ public class BlobTests
     [Fact]
     public void PhysicalRecordNumber_ShortBookmarkReturnsZero()
     {
-        Assert.Equal(0u, Blob.PhysicalRecordNumberFromBookmark(new byte[10]));
+        // Bookmark shorter than 4 bytes can't carry phys.
+        Assert.Equal(0u, Blob.PhysicalRecordNumberFromBookmark(new byte[3]));
         Assert.Equal(0u, Blob.PhysicalRecordNumberFromBookmark(ReadOnlySpan<byte>.Empty));
     }
 
