@@ -59,6 +59,20 @@ public class CryptoTests
     }
 
     [Fact]
+    public void RejectsCredentialsLongerThan255Bytes()
+    {
+        // The plaintext length prefixes are single bytes — a longer value
+        // would truncate silently and log in as the wrong user.
+        var overlong = new byte[256];
+        Array.Fill(overlong, (byte)'a');
+
+        Assert.Throws<ArgumentException>(
+            () => Crypto.EncryptLogin(overlong, "pass"u8.ToArray(), "elevatesoft"u8.ToArray()));
+        Assert.Throws<ArgumentException>(
+            () => Crypto.EncryptLogin("user"u8.ToArray(), overlong, "elevatesoft"u8.ToArray()));
+    }
+
+    [Fact]
     public void DifferentPasswordsProduceDifferentCiphertext()
     {
         var a = Crypto.EncryptLogin("user"u8, "passA"u8, "elevatesoft"u8);

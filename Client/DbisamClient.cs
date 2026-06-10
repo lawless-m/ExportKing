@@ -118,26 +118,29 @@ public sealed class DbisamClient : IDisposable
     {
         var schemaResp = QueryRaw(sql);
         List<Column> columns;
-        try
-        {
-            columns = Schema.Parse(schemaResp).Columns;
-        }
-        catch (IOException ex)
-        {
-            var head = schemaResp.AsSpan(0, Math.Min(256, schemaResp.Length));
-            throw new IOException(
-                $"{ex.Message} (response: {schemaResp.Length} bytes, " +
-                $"reqcode=0x{Response.BodyReqcode(schemaResp):X4}, " +
-                $"first {head.Length} bytes: {Convert.ToHexString(head)})", ex);
-        }
-
-        bool hasBlobs = materializeBlobs && columns.Any(c =>
-            c.FieldType is FieldType.Blob or FieldType.Memo or FieldType.Graphic);
-
         var rows = new List<object?[]>();
         var rowHashes = new List<byte[]>();
+        // The statement is prepared server-side once QueryRaw returns, so the
+        // cleanup chain in the finally must also cover a schema-parse failure
+        // — otherwise the orphaned statement leaks on the server.
         try
         {
+            try
+            {
+                columns = Schema.Parse(schemaResp).Columns;
+            }
+            catch (IOException ex)
+            {
+                var head = schemaResp.AsSpan(0, Math.Min(256, schemaResp.Length));
+                throw new IOException(
+                    $"{ex.Message} (response: {schemaResp.Length} bytes, " +
+                    $"reqcode=0x{Response.BodyReqcode(schemaResp):X4}, " +
+                    $"first {head.Length} bytes: {Convert.ToHexString(head)})", ex);
+            }
+
+            bool hasBlobs = materializeBlobs && columns.Any(c =>
+                c.FieldType is FieldType.Blob or FieldType.Memo or FieldType.Graphic);
+
             if (hasBlobs)
             {
                 DriveStreamingWithBlobs(columns, targetRows, rows, rowHashes);
@@ -264,7 +267,13 @@ public sealed class DbisamClient : IDisposable
                 rowsInBatch++;
             }
 
-            if (gotEoc || rowsInBatch == 0) break;
+            if (gotEoc) break;
+            if (rowsInBatch == 0)
+            {
+                throw new IOException(
+                    "Exportmaster: GetNextRecord delivered no rows and no end-of-cursor " +
+                    "— refusing to return a silently truncated result set");
+            }
         }
     }
 

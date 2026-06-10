@@ -178,21 +178,38 @@ public static class Response
             int rowCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(countUnit.Value.Span);
             int rowBufStart = walker.Position; // position of the length prefix
             var rowBuf = walker.NextUnit();
-            if (rowBuf is not null && rowCount > 0 && rowBuf.Value.Length % rowCount == 0)
+            if (rowBuf is null && rowCount > 0)
             {
+                throw new IOException(
+                    $"Exportmaster: ReadRecordBlock declared {rowCount} rows but carried no row buffer");
+            }
+            if (rowBuf is not null && rowCount > 0)
+            {
+                // The response declared rowCount rows; failing to slice them
+                // must be loud — dropping them here would silently truncate
+                // the result set.
+                if (rowBuf.Value.Length % rowCount != 0)
+                {
+                    throw new IOException(
+                        $"Exportmaster: ReadRecordBlock row buffer ({rowBuf.Value.Length} bytes) " +
+                        $"is not divisible by its declared row count {rowCount}");
+                }
                 int actualRecordSize = rowBuf.Value.Length / rowCount;
                 int lo = Math.Max(0, expectedRecordSize - 32);
                 int hi = expectedRecordSize + 32;
-                if (actualRecordSize >= lo && actualRecordSize <= hi)
+                if (actualRecordSize < lo || actualRecordSize > hi)
                 {
-                    // rowBuf payload starts 4 bytes after rowBufStart (past
-                    // its own length prefix). We carry payload-buffer
-                    // absolute offsets so callers can slice the original body.
-                    int payloadStart = rowBufStart + 4;
-                    for (int i = 0; i < rowCount; i++)
-                    {
-                        rows.Add((payloadStart + i * actualRecordSize, actualRecordSize));
-                    }
+                    throw new IOException(
+                        $"Exportmaster: ReadRecordBlock record size {actualRecordSize} " +
+                        $"outside expected {expectedRecordSize}±32");
+                }
+                // rowBuf payload starts 4 bytes after rowBufStart (past
+                // its own length prefix). We carry payload-buffer
+                // absolute offsets so callers can slice the original body.
+                int payloadStart = rowBufStart + 4;
+                for (int i = 0; i < rowCount; i++)
+                {
+                    rows.Add((payloadStart + i * actualRecordSize, actualRecordSize));
                 }
 
                 // Bookmark buffer: per-row physical-record bookmarks,

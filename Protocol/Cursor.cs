@@ -79,15 +79,38 @@ public static class Cursor
         resp = Framing.SendRecv(stream, Messages.BuildReadFirstRecordBlock(CursorHandle, firstN));
         if (ProcessBody(resp, ReplyKind.RecordBlock)) return rowsSeen;
 
-        // Phase 4: ReadNextRecordBlock loop.
-        int maxBatches = targetRows / Math.Max(1, (int)batchSize) + 10;
-        for (int b = 0; b < maxBatches; b++)
+        // Phase 4: ReadNextRecordBlock loop. Runs until end-of-cursor or
+        // targetRows. A "not ready" status gets a bounded retry (the server
+        // can stall mid-read); any other batch that delivers no rows and no
+        // EoC is a protocol error — continuing would either spin forever or
+        // silently truncate the result set.
+        int notReadyPolls = 0;
+        while (rowsSeen < targetRows)
         {
-            if (rowsSeen >= targetRows) break;
+            int before = rowsSeen;
             int remaining = targetRows - rowsSeen;
             uint n = (uint)Math.Max(1, Math.Min(remaining, (int)batchSize));
             resp = Framing.SendRecv(stream, Messages.BuildReadNextRecordBlock(CursorHandle, n));
             if (ProcessBody(resp, ReplyKind.RecordBlock)) break;
+            if (rowsSeen > before)
+            {
+                notReadyPolls = 0;
+                continue;
+            }
+            bool notReady = Response.BodyReqcode(resp) == Response.PollingSentinelReqcode
+                || IsNotReadyInner(resp);
+            if (notReady)
+            {
+                if (++notReadyPolls >= MaxReceivePolls)
+                {
+                    throw new IOException(
+                        $"Exportmaster: cursor still 'not ready' after {MaxReceivePolls} ReadNextRecordBlock polls");
+                }
+                continue;
+            }
+            throw new IOException(
+                "Exportmaster: ReadNextRecordBlock delivered no rows and no end-of-cursor " +
+                "— refusing to return a silently truncated result set");
         }
 
         return rowsSeen;
@@ -103,15 +126,28 @@ public static class Cursor
             while (true)
             {
                 CursorBatch? batch;
-                try
+                if (kind == ReplyKind.SingleRow)
                 {
-                    batch = kind == ReplyKind.SingleRow
-                        ? Response.ReadBatch(walker, recordSize)
-                        : Response.ReadRecordBlockBatch(walker, recordSize);
+                    // ExecuteStatement / Receive / SetToBegin replies are
+                    // heterogeneous (status shapes, not-ready inners with no
+                    // cursor-info); a body that isn't batch-shaped is expected
+                    // and simply carries no rows.
+                    try
+                    {
+                        batch = Response.ReadBatch(walker, recordSize);
+                    }
+                    catch (IOException)
+                    {
+                        return false;
+                    }
                 }
-                catch (IOException)
+                else
                 {
-                    return false;
+                    // ReadRecordBlock replies have exactly one shape. A
+                    // malformed one is a protocol error, not end-of-cursor —
+                    // swallowing it here would silently truncate the result
+                    // set. Only clean exhaustion (null) means no more batches.
+                    batch = Response.ReadRecordBlockBatch(walker, recordSize);
                 }
                 if (batch is null) return false;
 
@@ -132,8 +168,21 @@ public static class Cursor
                     rowsSeen++;
                 }
                 if (batch.ResultCode != Response.ResultOk) return true;
-                if (walker.Position >= body.Length) return false;
+                if (IsExhausted(body, walker.Position)) return false;
             }
+        }
+
+        // The framing envelope reports the 8-byte-aligned total, so a body
+        // can carry up to 7 zero bytes of tail padding after the last batch.
+        static bool IsExhausted(byte[] body, int pos)
+        {
+            if (pos >= body.Length) return true;
+            if (body.Length - pos > 7) return false;
+            for (int i = pos; i < body.Length; i++)
+            {
+                if (body[i] != 0) return false;
+            }
+            return true;
         }
 
         static bool IsNotReadyInner(byte[] body)

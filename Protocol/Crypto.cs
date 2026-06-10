@@ -29,6 +29,13 @@ public static class Crypto
         ReadOnlySpan<byte> password,
         ReadOnlySpan<byte> encryptPassword)
     {
+        // Lengths are single-byte prefixes in the plaintext; anything longer
+        // would truncate silently and log in as the wrong user.
+        if (username.Length > 255 || password.Length > 255)
+        {
+            throw new ArgumentException(
+                "Exportmaster: username/password longer than 255 bytes cannot be length-prefixed");
+        }
         int rawLen = 2 + username.Length + password.Length;
         int pad = (8 - (rawLen % 8)) % 8;
         int paddedLen = rawLen + pad;

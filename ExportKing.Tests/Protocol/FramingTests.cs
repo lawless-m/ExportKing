@@ -86,6 +86,20 @@ public class FramingTests
     }
 
     [Fact]
+    public void RecvMsgRejectsBodyLengthAboveSanityCap()
+    {
+        // A corrupt/hostile total_len must throw before any allocation, so
+        // only the 20-byte header needs to be present.
+        var pkt = new byte[20];
+        Framing.Guid.AsSpan().CopyTo(pkt);
+        BinaryPrimitives.WriteUInt32LittleEndian(pkt.AsSpan(16, 4), (uint)Framing.MaxBodyLen + 21);
+
+        using var ms = new MemoryStream(pkt);
+        var ex = Assert.Throws<IOException>(() => Framing.RecvMsg(ms));
+        Assert.Contains("sanity cap", ex.Message);
+    }
+
+    [Fact]
     public void RecvMsgThrowsOnShortRead()
     {
         // Valid header claiming a 100-byte body, but stream only has 10.

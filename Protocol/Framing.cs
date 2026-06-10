@@ -23,6 +23,14 @@ public static class Framing
     /// server ever rejects it during cross-host testing, we'd need to
     /// negotiate it.
     /// </summary>
+    /// <summary>
+    /// Sanity cap on the server-supplied body length. A legitimate response
+    /// is a few MB at most (batch_size rows × record width, or one blob
+    /// payload); the bound only exists so a corrupt or hostile length field
+    /// can't make us allocate unbounded memory.
+    /// </summary>
+    public const int MaxBodyLen = 256 * 1024 * 1024;
+
     public static readonly byte[] Guid =
     {
         0x8A, 0xBE, 0x8E, 0x59, 0x23, 0x64, 0xCB, 0x40,
@@ -80,6 +88,11 @@ public static class Framing
         {
             throw new IOException($"Exportmaster: bad total_len in header: {total}");
         }
+        if (total - 20 > MaxBodyLen)
+        {
+            throw new IOException(
+                $"Exportmaster: body length {total - 20} exceeds sanity cap {MaxBodyLen}");
+        }
         var body = new byte[total - 20];
         ReadExact(stream, body);
         return body;
@@ -109,7 +122,18 @@ public static class Framing
     {
         var client = new TcpClient();
         var connectTask = client.ConnectAsync(host, port);
-        if (!connectTask.Wait(TimeSpan.FromSeconds(10)))
+        bool completed;
+        try
+        {
+            completed = connectTask.Wait(TimeSpan.FromSeconds(10));
+        }
+        catch (AggregateException ex) when (ex.InnerException is { } inner)
+        {
+            // Surface the SocketException itself, not Wait()'s wrapper.
+            client.Close();
+            throw inner;
+        }
+        if (!completed)
         {
             client.Close();
             throw new IOException($"Exportmaster: connect {host}:{port}: timeout");
