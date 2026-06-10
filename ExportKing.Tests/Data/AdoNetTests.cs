@@ -85,6 +85,64 @@ public class AdoNetTests
         Assert.Throws<IndexOutOfRangeException>(() => r.GetOrdinal("Nope"));
     }
 
+    [Fact]
+    public void ConnectionStringBuilder_ThrowsOnUnparseableValues()
+    {
+        // Silent fallback masked typos — worst case 'Materialize Blobs=0'
+        // (ODBC spelling) quietly meant true. Now 0/1/yes/no parse and
+        // anything else throws.
+        Assert.False(new DbisamConnectionStringBuilder("Host=h;Materialize Blobs=0").MaterializeBlobs);
+        Assert.False(new DbisamConnectionStringBuilder("Host=h;Materialize Blobs=no").MaterializeBlobs);
+        Assert.True(new DbisamConnectionStringBuilder("Host=h;Materialize Blobs=1").MaterializeBlobs);
+        Assert.True(new DbisamConnectionStringBuilder("Host=h;Materialize Blobs=yes").MaterializeBlobs);
+
+        Assert.Throws<ArgumentException>(
+            () => new DbisamConnectionStringBuilder("Host=h;Materialize Blobs=maybe").MaterializeBlobs);
+        Assert.Throws<ArgumentException>(
+            () => new DbisamConnectionStringBuilder("Host=h;Port=abc").Port);
+        Assert.Throws<ArgumentException>(
+            () => new DbisamConnectionStringBuilder("Host=h;Port=0").Port);
+        Assert.Throws<ArgumentException>(
+            () => new DbisamConnectionStringBuilder("Host=h;Batch Size=-1").BatchSize);
+    }
+
+    [Fact]
+    public void DataReader_GetDecimalConvertsFloatCells()
+    {
+        var columns = new List<Column>
+        {
+            new() { Ord = 1, Name = "Price", FieldType = FieldType.Float, Decl = 0, Max = 8, RowOffset = 25 },
+        };
+        var result = new QueryResult
+        {
+            Columns = columns,
+            Rows = new List<object?[]> { new object?[] { 1.25d } },
+            RowHashes = new List<byte[]> { new byte[16] },
+        };
+        using var r = new DbisamDataReader(result, blobsMaterialized: true, closeOnDispose: null);
+        r.Read();
+        Assert.Equal(1.25m, r.GetDecimal(0));
+    }
+
+    [Fact]
+    public void DataReader_GetBytesRejectsUnresolvedBlobHandle()
+    {
+        var columns = new List<Column>
+        {
+            new() { Ord = 1, Name = "Notes", FieldType = FieldType.Memo, Decl = 0, Max = 8, RowOffset = 25 },
+        };
+        var result = new QueryResult
+        {
+            Columns = columns,
+            Rows = new List<object?[]> { new object?[] { new byte[8] { 1, 2, 3, 4, 5, 6, 7, 8 } } },
+            RowHashes = new List<byte[]> { new byte[16] },
+        };
+        using var r = new DbisamDataReader(result, blobsMaterialized: false, closeOnDispose: null);
+        r.Read();
+        var ex = Assert.Throws<InvalidOperationException>(() => r.GetBytes(0, 0, new byte[8], 0, 8));
+        Assert.Contains("Materialize Blobs", ex.Message);
+    }
+
     private static QueryResult SampleResult()
     {
         var columns = new List<Column>

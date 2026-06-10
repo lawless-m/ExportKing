@@ -114,6 +114,19 @@ public class WalkerTests
         Assert.Equal(first, firstAgain);
     }
 
+    [Fact]
+    public void HugeLengthPrefixThrowsIOException()
+    {
+        // A length >= 2^31 must surface as IOException (malformed wire), not
+        // slip past the overrun check via a negative int cast.
+        var buf = new List<byte>();
+        AppendLength(buf, 0xFFFFFFFF);
+        buf.AddRange(new byte[] { 0x01, 0x02 });
+
+        var w = new Walker(buf.ToArray());
+        Assert.Throws<IOException>(() => w.NextUnit());
+    }
+
     private static void AppendLength(List<byte> buf, uint length)
     {
         Span<byte> tmp = stackalloc byte[4];

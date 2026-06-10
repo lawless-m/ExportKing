@@ -81,6 +81,41 @@ public class ResponseTests
         Assert.Contains("no row buffer", ex.Message);
     }
 
+    // Real error bodies captured from dbsrvr.exe on rivsem04 (2026-06-10).
+    private const string WrongCatalogHex =
+        "001E2C3F000000000000000F0000004E4F5F535543485F434154414C4F4700000000000000000000" +
+        "000000000000000000000000000004000000000000000400000000000000000000000000";
+    private const string WrongPasswordHex = "00172C000000000400000003";
+
+    [Fact]
+    public void TryGetServerErrorExtractsCodeAndDetail()
+    {
+        var body = Convert.FromHexString(WrongCatalogHex);
+        Assert.True(Response.TryGetServerError(body, out var code, out var detail));
+        Assert.Equal(0x2C1E, code);
+        Assert.Equal("NO_SUCH_CATALOG", detail);
+    }
+
+    [Fact]
+    public void TryGetServerErrorToleratesTruncatedBody()
+    {
+        // The wrong-password reply ends mid-unit; the code alone comes back.
+        var body = Convert.FromHexString(WrongPasswordHex);
+        Assert.True(Response.TryGetServerError(body, out var code, out var detail));
+        Assert.Equal(0x2C17, code);
+        Assert.Equal("", detail);
+    }
+
+    [Fact]
+    public void TryGetServerErrorIgnoresSuccessAndSentinel()
+    {
+        var success = new byte[] { 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00 };
+        Assert.False(Response.TryGetServerError(success, out _, out _));
+
+        var sentinel = new byte[] { 0x00, 0x14, 0x2C, 0x00, 0x00, 0x00, 0x00 };
+        Assert.False(Response.TryGetServerError(sentinel, out _, out _));
+    }
+
     [Fact]
     public void ReadRecordBlockBatchAcceptsZeroRows()
     {

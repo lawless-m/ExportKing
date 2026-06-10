@@ -25,6 +25,8 @@ public sealed class DbisamCommand : DbCommand
 
     [AllowNull]
     public override string CommandText { get; set; } = "";
+    /// <summary>Accepted for API compatibility but not enforced — the
+    /// underlying stream uses a fixed 30s read/write timeout.</summary>
     public override int CommandTimeout { get; set; }
     public override CommandType CommandType { get; set; } = CommandType.Text;
     public override bool DesignTimeVisible { get; set; }
@@ -69,7 +71,9 @@ public sealed class DbisamCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText is empty.");
 
-        int targetRows = behavior.HasFlag(CommandBehavior.SingleRow) ? 1 : int.MaxValue;
+        int targetRows = behavior.HasFlag(CommandBehavior.SingleRow) ? 1
+            : behavior.HasFlag(CommandBehavior.SchemaOnly) ? 0
+            : int.MaxValue;
         bool materialize = MaterializeBlobs ?? conn.MaterializeBlobsDefault;
 
         var result = conn.AcquireClient().Query(CommandText, materialize, targetRows);

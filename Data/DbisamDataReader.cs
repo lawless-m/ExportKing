@@ -80,7 +80,7 @@ public sealed class DbisamDataReader : DbDataReader
     public override bool GetBoolean(int ordinal) => (bool)Raw(ordinal);
     public override byte GetByte(int ordinal) => (byte)Raw(ordinal);
     public override char GetChar(int ordinal) => (char)Raw(ordinal);
-    public override decimal GetDecimal(int ordinal) => (decimal)Raw(ordinal);
+    public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(Raw(ordinal));
     public override double GetDouble(int ordinal) => Convert.ToDouble(Raw(ordinal));
     public override float GetFloat(int ordinal) => Convert.ToSingle(Raw(ordinal));
     public override Guid GetGuid(int ordinal) => (Guid)Raw(ordinal);
@@ -98,6 +98,7 @@ public sealed class DbisamDataReader : DbDataReader
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
+        ThrowIfUnresolvedBlob(ordinal);
         var data = (byte[])Raw(ordinal);
         if (buffer is null) return data.Length;
         long available = data.Length - dataOffset;
@@ -109,6 +110,7 @@ public sealed class DbisamDataReader : DbDataReader
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
+        ThrowIfUnresolvedBlob(ordinal);
         var s = (string)Raw(ordinal);
         if (buffer is null) return s.Length;
         long available = s.Length - dataOffset;
@@ -135,7 +137,9 @@ public sealed class DbisamDataReader : DbDataReader
             var row = table.NewRow();
             row[SchemaTableColumn.ColumnName] = c.Name;
             row[SchemaTableColumn.ColumnOrdinal] = i;
-            row[SchemaTableColumn.ColumnSize] = (int)c.Max;
+            // For strings Decl is the declared character length; Max is the
+            // on-disk width (decl + length byte). Other types declare 0.
+            row[SchemaTableColumn.ColumnSize] = c.FieldType == FieldType.String ? c.Decl : (int)c.Max;
             row[SchemaTableColumn.DataType] = ClrType(c.FieldType, _blobsMaterialized);
             row[SchemaTableColumn.AllowDBNull] = true;
             row[SchemaTableColumn.ProviderType] = (int)c.FieldType;
@@ -157,6 +161,22 @@ public sealed class DbisamDataReader : DbDataReader
     {
         if (disposing) Close();
         base.Dispose(disposing);
+    }
+
+    /// <summary>
+    /// With <c>Materialize Blobs=false</c>, blob cells hold the server's
+    /// 8-byte handle, not content — returning those bytes from a content
+    /// getter would be silent garbage.
+    /// </summary>
+    private void ThrowIfUnresolvedBlob(int ordinal)
+    {
+        if (!_blobsMaterialized && _result.Columns[ordinal].FieldType
+                is FieldType.Blob or FieldType.Memo or FieldType.Graphic)
+        {
+            throw new InvalidOperationException(
+                $"Column '{GetName(ordinal)}' holds an unresolved blob handle — " +
+                "open with 'Materialize Blobs=true' to fetch content.");
+        }
     }
 
     /// <summary>Current cell, non-null, for the typed getters (throws on NULL

@@ -89,10 +89,12 @@ public static class Row
                 return null; // no storage
             case FieldType.String:
             {
-                // ASCII, null-terminated within max bytes. Trim at first 0x00.
+                // Null-terminated within max bytes; trim at first 0x00.
+                // Decoded UTF-8-if-valid, else Windows-1252 — the corpus
+                // contains CP1252 bytes (£, é, ™) that ASCII would corrupt.
                 int end = bytes.IndexOf((byte)0);
                 if (end < 0) end = bytes.Length;
-                return Encoding.ASCII.GetString(bytes[..end]);
+                return DbisamText.Decode(bytes[..end]);
             }
             case FieldType.Date:
             {

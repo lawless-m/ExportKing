@@ -47,16 +47,18 @@ public sealed class Walker
                 $"Exportmaster: wire walker ran past end at {_pos} " +
                 $"(need 4-byte length, have {_buf.Length - _pos})");
         }
-        int length = (int)BinaryPrimitives.ReadUInt32LittleEndian(_buf.Span.Slice(_pos, 4));
+        uint rawLength = BinaryPrimitives.ReadUInt32LittleEndian(_buf.Span.Slice(_pos, 4));
         int start = _pos + 4;
-        int end = start + length;
-        if (end > _buf.Length)
+        // Compare as unsigned before casting — a length >= 2^31 cast to int
+        // goes negative and would sail past the overrun check below.
+        if (rawLength > (uint)(_buf.Length - start))
         {
             throw new IOException(
-                $"Exportmaster: wire walker length {length} at pos {_pos} " +
+                $"Exportmaster: wire walker length {rawLength} at pos {_pos} " +
                 $"would overrun (buf len {_buf.Length})");
         }
-        _pos = end;
+        int length = (int)rawLength;
+        _pos = start + length;
         return _buf.Slice(start, length);
     }
 

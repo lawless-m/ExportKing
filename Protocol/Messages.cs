@@ -233,7 +233,9 @@ public static class Messages
     /// </summary>
     public static byte[] BuildQuery(string sql)
     {
-        var sqlBytes = Encoding.ASCII.GetBytes(sql + "\r\n");
+        // CP1252, matching what the Delphi server expects for AnsiString
+        // SQL text — ASCII would turn non-ASCII WHERE literals into '?'.
+        var sqlBytes = DbisamText.Encode(sql + "\r\n");
         uint n = (uint)sqlBytes.Length;
 
         ReadOnlySpan<byte> innerPre = stackalloc byte[]

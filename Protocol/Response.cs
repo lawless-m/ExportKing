@@ -146,6 +146,49 @@ public static class Response
     }
 
     /// <summary>
+    /// Detect a server error reply. Observed live on rivsem04: success
+    /// replies (login, catalog attach, prepare) carry body reqcode 0x0000;
+    /// errors echo the DBISAM error code instead — 0x2C17 (11287) wrong
+    /// password, 0x2C1E (11294) bad catalog, 0x2B02 (11010) missing table —
+    /// usually with the offending name as the first non-empty Pack unit.
+    /// The polling sentinel 0x2C14 is a status, not an error. Only valid
+    /// for handshake/prepare replies; cursor replies are handled by the
+    /// result-code units instead.
+    /// </summary>
+    public static bool TryGetServerError(byte[] body, out ushort code, out string detail)
+    {
+        code = BodyReqcode(body);
+        detail = "";
+        if (code == 0 || code == PollingSentinelReqcode) return false;
+
+        // Best-effort detail: first non-empty printable Pack unit.
+        try
+        {
+            var walker = new Walker(body, PackStreamOffset);
+            while (walker.NextUnit() is { } unit)
+            {
+                if (unit.Length == 0) continue; // errors lead with empty units
+                bool printable = true;
+                foreach (var b in unit.Span)
+                {
+                    if (b < 0x20) { printable = false; break; }
+                }
+                if (printable)
+                {
+                    detail = DbisamText.Decode(unit.Span);
+                    break;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            // Truncated/odd error bodies exist (the wrong-password reply
+            // ends mid-unit); the code alone is still meaningful.
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Parse a <c>ReadFirstRecordBlock</c> / <c>ReadNextRecordBlock</c>
     /// response (reqcode 0x050A / 0x04F6). Layout decoded empirically from
     /// live captures:

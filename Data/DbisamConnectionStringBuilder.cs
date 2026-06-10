@@ -27,7 +27,7 @@ public sealed class DbisamConnectionStringBuilder : DbConnectionStringBuilder
 
     public int Port
     {
-        get => GetInt("Port", 12005);
+        get => GetInt("Port", 12005, min: 1, max: 65535);
         set => this["Port"] = value;
     }
 
@@ -53,7 +53,7 @@ public sealed class DbisamConnectionStringBuilder : DbConnectionStringBuilder
     /// <summary>Rows per ReadFirstRecordBlock / GetNextRecord call.</summary>
     public uint BatchSize
     {
-        get => (uint)GetInt("Batch Size", 5000);
+        get => (uint)GetInt("Batch Size", 5000, min: 1, max: int.MaxValue);
         set => this["Batch Size"] = value;
     }
 
@@ -84,9 +84,31 @@ public sealed class DbisamConnectionStringBuilder : DbConnectionStringBuilder
     private string GetString(string key, string fallback)
         => TryGetValue(key, out var v) && v is not null ? v.ToString() ?? fallback : fallback;
 
-    private int GetInt(string key, int fallback)
-        => TryGetValue(key, out var v) && v is not null && int.TryParse(v.ToString(), out var i) ? i : fallback;
+    // Unparseable values throw rather than silently using the default —
+    // "Materialize Blobs=oui" quietly meaning true masks config typos.
+    private int GetInt(string key, int fallback, int min, int max)
+    {
+        if (!TryGetValue(key, out var v) || v is null) return fallback;
+        if (!int.TryParse(v.ToString(), out var i) || i < min || i > max)
+        {
+            throw new ArgumentException(
+                $"DBISAM: '{key}' value '{v}' is not an integer in [{min}..{max}].");
+        }
+        return i;
+    }
 
     private bool GetBool(string key, bool fallback)
-        => TryGetValue(key, out var v) && v is not null && bool.TryParse(v.ToString(), out var b) ? b : fallback;
+    {
+        if (!TryGetValue(key, out var v) || v is null) return fallback;
+        var s = v.ToString();
+        // ODBC-style spellings accepted alongside true/false.
+        switch (s?.Trim().ToLowerInvariant())
+        {
+            case "true" or "yes" or "1": return true;
+            case "false" or "no" or "0": return false;
+            default:
+                throw new ArgumentException(
+                    $"DBISAM: '{key}' value '{v}' is not a boolean (true/false/yes/no/1/0).");
+        }
+    }
 }

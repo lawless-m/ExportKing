@@ -17,8 +17,13 @@ public static class Cursor
     /// <summary>Per-session cursor handle. Always 1 (one cursor per session).</summary>
     public const uint CursorHandle = 1;
 
-    /// <summary>Max Receive-poll iterations before giving up.</summary>
-    private const int MaxReceivePolls = 100;
+    /// <summary>
+    /// Max "not ready" poll iterations before giving up. Shared with the
+    /// streaming blob path in <c>DbisamClient</c>; 600 is the higher of the
+    /// two bounds the paths previously used (big-table cursor
+    /// materialisation needs the headroom).
+    /// </summary>
+    internal const int MaxReceivePolls = 600;
 
     /// <summary>
     /// Total on-disk record width per protocol §6c: <c>row_offset</c> of

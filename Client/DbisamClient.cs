@@ -70,26 +70,48 @@ public sealed class DbisamClient : IDisposable
     public static DbisamClient ConnectAndLogin(ConnectOptions opts)
     {
         var tcp = Framing.Connect(opts.Host, opts.Port);
-        var stream = tcp.GetStream();
+        try
+        {
+            var stream = tcp.GetStream();
 
-        // Connect.
-        var connectBody = Messages.BuildConnect(opts.ConnectHostname, opts.ConnectNonce);
-        _ = Framing.SendRecv(stream, connectBody);
+            // Connect.
+            var connectBody = Messages.BuildConnect(opts.ConnectHostname, opts.ConnectNonce);
+            _ = Framing.SendRecv(stream, connectBody);
 
-        // Login.
-        var ct = Crypto.EncryptLogin(
-            Encoding.ASCII.GetBytes(opts.User),
-            Encoding.ASCII.GetBytes(opts.Password),
-            Encoding.ASCII.GetBytes(opts.EncryptPassword));
-        _ = Framing.SendRecv(stream, Messages.BuildLogin(ct));
+            // Login. The server signals a rejected login by echoing the
+            // DBISAM error code (e.g. 0x2C17) as the body reqcode — fail
+            // here rather than as a baffling schema error on the first query.
+            var ct = Crypto.EncryptLogin(
+                Encoding.ASCII.GetBytes(opts.User),
+                Encoding.ASCII.GetBytes(opts.Password),
+                Encoding.ASCII.GetBytes(opts.EncryptPassword));
+            var loginResp = Framing.SendRecv(stream, Messages.BuildLogin(ct));
+            if (Response.TryGetServerError(loginResp, out var loginCode, out _))
+            {
+                throw new IOException(
+                    $"Exportmaster: login failed for user '{opts.User}' (server code 0x{loginCode:X4})");
+            }
 
-        // Session setup.
-        _ = Framing.SendRecv(stream, Messages.SessionSetupC2);
-        _ = Framing.SendRecv(stream, Messages.SessionSetupC3);
-        _ = Framing.SendRecv(stream, Messages.BuildCatalogAttach(opts.Catalog));
-        _ = Framing.SendRecv(stream, Messages.SessionSetupPost);
+            // Session setup.
+            _ = Framing.SendRecv(stream, Messages.SessionSetupC2);
+            _ = Framing.SendRecv(stream, Messages.SessionSetupC3);
+            var attachResp = Framing.SendRecv(stream, Messages.BuildCatalogAttach(opts.Catalog));
+            if (Response.TryGetServerError(attachResp, out var attachCode, out var attachDetail))
+            {
+                throw new IOException(
+                    $"Exportmaster: catalog attach failed: '{(attachDetail.Length > 0 ? attachDetail : opts.Catalog)}' " +
+                    $"(server code 0x{attachCode:X4})");
+            }
+            _ = Framing.SendRecv(stream, Messages.SessionSetupPost);
 
-        return new DbisamClient(tcp, stream, opts);
+            return new DbisamClient(tcp, stream, opts);
+        }
+        catch
+        {
+            // Failed logins are routine; don't leak the socket to the finalizer.
+            tcp.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -131,6 +153,12 @@ public sealed class DbisamClient : IDisposable
             }
             catch (IOException ex)
             {
+                if (Response.TryGetServerError(schemaResp, out var code, out var detail))
+                {
+                    throw new IOException(
+                        $"Exportmaster: server rejected the statement (code 0x{code:X4}" +
+                        $"{(detail.Length > 0 ? $": '{detail}'" : "")})", ex);
+                }
                 var head = schemaResp.AsSpan(0, Math.Min(256, schemaResp.Length));
                 throw new IOException(
                     $"{ex.Message} (response: {schemaResp.Length} bytes, " +
@@ -188,7 +216,7 @@ public sealed class DbisamClient : IDisposable
         var resp = Framing.SendRecv(_stream, Messages.BuildExecuteStatement(handle));
         for (int polls = 0; IsNotReady(resp); polls++)
         {
-            if (polls >= 600)
+            if (polls >= Cursor.MaxReceivePolls)
                 throw new IOException($"Exportmaster: cursor still 'not ready' after {polls} Receive polls");
             resp = Framing.SendRecv(_stream, Messages.BuildReceive());
         }
@@ -256,9 +284,13 @@ public sealed class DbisamClient : IDisposable
                     // Free the server-side buffer using the ECHOED slot bytes,
                     // or the per-cursor blob cache fills and OpenBlob starts
                     // returning 0x2303.
-                    try { _ = Framing.SendRecv(_stream, Messages.BuildFreeBlob(handle, fieldOrd, outcome.SlotEcho)); } catch { }
+                    try { _ = Framing.SendRecv(_stream, Messages.BuildFreeBlob(handle, fieldOrd, outcome.SlotEcho)); }
+                    catch (Exception e)
+                    {
+                        if (debug) Console.Error.WriteLine($"[em-blob] FreeBlob row={rows.Count} col={i} FAIL: {e.Message}");
+                    }
 
-                    cells[i] = ft == FieldType.Memo ? Encoding.ASCII.GetString(outcome.Payload) : outcome.Payload;
+                    cells[i] = ft == FieldType.Memo ? DbisamText.Decode(outcome.Payload) : outcome.Payload;
                 }
 
                 rows.Add(cells);

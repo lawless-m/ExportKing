@@ -43,6 +43,14 @@ public sealed class DbisamConnection : DbConnection
         get => _connectionString;
         set
         {
+            if (_state != ConnectionState.Closed)
+            {
+                // AcquireClient re-logs-in per command using the builder, so
+                // a mid-connection change would silently redirect later
+                // commands. ADO.NET convention: only settable while closed.
+                throw new InvalidOperationException(
+                    "DBISAM: ConnectionString cannot be changed while the connection is open.");
+            }
             _connectionString = value ?? "";
             _builder = new DbisamConnectionStringBuilder(_connectionString);
         }
