@@ -1,5 +1,8 @@
 # ExportKing
 
+> **Consuming Exportmaster from your own service?** See [`USAGE.md`](USAGE.md) — connection
+> string, the verified `NISAINT_CS` catalog, and SELECT + INSERT examples.
+>
 > **Picking this up?** Read [`NEXT_STEPS.md`](NEXT_STEPS.md) first — it's the
 > actionable to-do list. `PLAN.md` is the staged history.
 
@@ -35,7 +38,8 @@ This library fixes both by speaking DBISAM's TCP protocol directly:
 ## Scope
 
 **In:**
-- `SELECT` queries
+- `SELECT` queries (`ExecuteReader`/`ExecuteScalar`)
+- DML — `INSERT`/`UPDATE`/`DELETE` via `ExecuteNonQuery` (inline literals; no parameters)
 - Connect + login + session setup + cursor fetch + cleanup
 - Memo/blob/graphic column content — `Query(materializeBlobs: true)` streams
   rows via `GetNextRecord` and resolves each handle inline (`0x0280` OpenBlob
@@ -48,8 +52,6 @@ This library fixes both by speaking DBISAM's TCP protocol directly:
 - Linux and Windows
 
 **Out (explicit non-goals):**
-- DML (`INSERT`/`UPDATE`/`DELETE`) — RocsMiddleware writes go through
-  Exportmaster's XML-RPC API (`EMUpdater`), not this library
 - DDL
 - Transactions
 - Connection pooling
